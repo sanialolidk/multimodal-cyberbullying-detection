@@ -1,0 +1,25 @@
+post_id,user_id,target_user_id,text,label
+p001,u01,u02,"Nobody wants you here, just delete your account already",1
+p002,u03,u04,"Great point in the thread, thanks for explaining it clearly",0
+p003,u05,u02,"You are such a loser and everyone knows it",1
+p004,u02,u03,"I disagree, but I see why you think that",0
+p005,u06,u07,"Stop posting your ugly selfies, they make me sick",1
+p006,u08,u09,"That was a helpful summary of the assignment",0
+p007,u01,u05,"You are dumb, worthless, and pathetic",1
+p008,u10,u03,"Can you share the article you mentioned earlier",0
+p009,u11,u12,"Everyone should block this idiot right now",1
+p010,u04,u01,"Nice work on the project, the charts were clean",0
+p011,u13,u02,"Go away, nobody likes your stupid comments",1
+p012,u14,u15,"Happy birthday, hope you have a wonderful day",0
+p013,u05,u07,"Your face is disgusting and your posts are trash",1
+p014,u16,u10,"I appreciate the feedback and will revise it",0
+p015,u11,u02,"You deserve to be mocked for being so useless",1
+p016,u12,u11,"Let's keep the discussion respectful please",0
+p017,u06,u02,"Shut up, you are embarrassing yourself again",1
+p018,u09,u08,"Thanks for helping me debug the notebook",0
+p019,u13,u07,"Nobody asked you, creep",1
+p020,u15,u14,"The meeting notes look good to me",0
+p021,u17,u18,"Your idea is terrible and you should feel ashamed",1
+p022,u18,u17,"Could you clarify the last requirement",0
+p023,u01,u07,"Everyone laugh at this clown",1
+p024,u19,u20,"Congratulations on finishing the sprint",0
