@@ -13,7 +13,7 @@ import argparse
 import math
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -42,7 +42,7 @@ POSITIVE_LEXICON = {
 
 
 def normalize_text(text: str) -> str:
-    text = text.lower()
+    text = str(text).lower()
     text = re.sub(r"http\S+|www\.\S+", " ", text)
     text = re.sub(r"[^a-z0-9\s']", " ", text)
     return re.sub(r"\s+", " ", text).strip()
@@ -63,20 +63,18 @@ class FeatureArtifacts:
     feature_names: list[str]
     means: np.ndarray
     stds: np.ndarray
+    network_graph: dict = field(default_factory=dict)
 
 
 def fit_tfidf(tokenized_docs: list[list[str]], max_features: int = 60) -> tuple[np.ndarray, list[str], np.ndarray]:
-    doc_freq = Counter()
+    doc_freq: Counter = Counter()
     term_counts = []
     for tokens in tokenized_docs:
         counts = Counter(tokens)
         term_counts.append(counts)
         doc_freq.update(counts.keys())
 
-    vocabulary = [
-        term
-        for term, _ in doc_freq.most_common(max_features)
-    ]
+    vocabulary = [term for term, _ in doc_freq.most_common(max_features)]
     vocab_index = {term: idx for idx, term in enumerate(vocabulary)}
     n_docs = len(tokenized_docs)
     idf = np.array([
@@ -129,34 +127,44 @@ def embedding_features(tokenized_docs: list[list[str]]) -> tuple[np.ndarray, lis
     return np.array(rows, dtype=float), names
 
 
-def network_features(df: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
-    outgoing = defaultdict(int)
-    incoming = defaultdict(int)
-    pair_counts = defaultdict(int)
-    neighbors = defaultdict(set)
+def network_features_fit(df: pd.DataFrame) -> dict:
+    """Build interaction graph statistics from training data only."""
+    outgoing = df.groupby("user_id").size().to_dict()
+    incoming = df.groupby("target_user_id").size().to_dict()
+    pair_counts = df.groupby(["user_id", "target_user_id"]).size().to_dict()
 
-    for _, row in df.iterrows():
-        source = row["user_id"]
-        target = row["target_user_id"]
-        outgoing[source] += 1
-        incoming[target] += 1
-        pair_counts[(source, target)] += 1
-        neighbors[source].add(target)
-        neighbors[target].add(source)
+    edges = pd.concat([
+        df[["user_id", "target_user_id"]].rename(columns={"user_id": "a", "target_user_id": "b"}),
+        df[["target_user_id", "user_id"]].rename(columns={"target_user_id": "a", "user_id": "b"}),
+    ])
+    neighbor_counts = edges.groupby("a")["b"].nunique().to_dict()
 
-    rows = []
-    for _, row in df.iterrows():
-        source = row["user_id"]
-        target = row["target_user_id"]
-        rows.append([
-            outgoing[source],
-            incoming[source],
-            incoming[target],
-            pair_counts[(source, target)],
-            len(neighbors[source]),
-            len(neighbors[target]),
-        ])
+    return {
+        "outgoing": outgoing,
+        "incoming": incoming,
+        "pair_counts": pair_counts,
+        "neighbors": neighbor_counts,
+    }
 
+
+def network_features_transform(df: pd.DataFrame, graph: dict) -> tuple[np.ndarray, list[str]]:
+    """Apply pre-fitted graph statistics to a DataFrame (unseen users get 0)."""
+    outgoing = graph["outgoing"]
+    incoming = graph["incoming"]
+    pair_counts = graph["pair_counts"]
+    neighbors = graph["neighbors"]
+
+    rows = [
+        [
+            outgoing.get(row.user_id, 0),
+            incoming.get(row.user_id, 0),
+            incoming.get(row.target_user_id, 0),
+            pair_counts.get((row.user_id, row.target_user_id), 0),
+            neighbors.get(row.user_id, 0),
+            neighbors.get(row.target_user_id, 0),
+        ]
+        for row in df.itertuples(index=False)
+    ]
     names = [
         "net_author_out_degree",
         "net_author_in_degree",
@@ -218,87 +226,122 @@ def metrics(y_true: np.ndarray, probabilities: np.ndarray) -> dict[str, float]:
         "precision": precision,
         "recall": recall,
         "f1": f1,
-        "tp": tp,
-        "tn": tn,
-        "fp": fp,
-        "fn": fn,
+        "tp": tp, "tn": tn, "fp": fp, "fn": fn,
     }
 
 
-def make_features(df: pd.DataFrame) -> tuple[np.ndarray, FeatureArtifacts]:
-    tokens = [tokenize(text) for text in df["text"]]
-    tfidf, vocabulary, idf = fit_tfidf(tokens)
-    embeddings, embedding_names = embedding_features(tokens)
-    graph, graph_names = network_features(df)
-    raw = np.hstack([tfidf, embeddings, graph])
-    scaled, means, stds = standardize_fit(raw)
-    names = [f"tfidf_{term}" for term in vocabulary] + embedding_names + graph_names
-    return scaled, FeatureArtifacts(vocabulary, idf, names, means, stds)
-
-
-def stratified_train_test_split(y: np.ndarray, test_fraction: float = 0.25) -> tuple[np.ndarray, np.ndarray]:
-    train_parts = []
-    test_parts = []
+def stratified_train_test_split(
+    y: np.ndarray,
+    test_fraction: float = 0.25,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    train_parts, test_parts = [], []
     for label in sorted(set(y.tolist())):
-        label_indices = np.where(y == label)[0]
+        label_indices = rng.permutation(np.where(y == label)[0])
         n_test = max(1, round(len(label_indices) * test_fraction))
         test_parts.append(label_indices[:n_test])
         train_parts.append(label_indices[n_test:])
-    train_idx = np.concatenate(train_parts)
-    test_idx = np.concatenate(test_parts)
-    return train_idx, test_idx
+    return np.concatenate(train_parts), np.concatenate(test_parts)
+
+
+def make_features_fit(df: pd.DataFrame) -> tuple[np.ndarray, FeatureArtifacts]:
+    """Fit all feature extractors on training data and return the feature matrix + artifacts."""
+    tokens = [tokenize(text) for text in df["text"]]
+    tfidf, vocabulary, idf = fit_tfidf(tokens)
+    embeddings, embedding_names = embedding_features(tokens)
+    graph = network_features_fit(df)
+    net, graph_names = network_features_transform(df, graph)
+
+    raw = np.hstack([tfidf, embeddings, net])
+    scaled, means, stds = standardize_fit(raw)
+    names = [f"tfidf_{term}" for term in vocabulary] + embedding_names + graph_names
+    return scaled, FeatureArtifacts(vocabulary, idf, names, means, stds, graph)
+
+
+def make_features_transform(df: pd.DataFrame, artifacts: FeatureArtifacts) -> np.ndarray:
+    """Transform new data using artifacts fit on training data (no leakage)."""
+    tokens = [tokenize(text) for text in df["text"]]
+    tfidf = transform_tfidf(tokens, artifacts.vocabulary, artifacts.idf)
+    embeddings, _ = embedding_features(tokens)
+    net, _ = network_features_transform(df, artifacts.network_graph)
+
+    raw = np.hstack([tfidf, embeddings, net])
+    return standardize_transform(raw, artifacts.means, artifacts.stds)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a multimodal cyberbullying detector.")
-    parser.add_argument("--data", default="sample_cyberbullying_data.csv", help="CSV with post_id,user_id,target_user_id,text,label")
-    parser.add_argument("--top-n", type=int, default=12, help="Number of strongest model features to print")
+    parser.add_argument("--data", default="sample_cyberbullying_data.csv",
+                        help="CSV with post_id,user_id,target_user_id,text,label")
+    parser.add_argument("--top-n", type=int, default=12,
+                        help="Number of strongest model features to print")
     args = parser.parse_args()
 
     data_path = Path(args.data)
+    if not data_path.exists():
+        raise FileNotFoundError(f"Data file not found: {data_path}")
+
     df = pd.read_csv(data_path)
+
     required = {"post_id", "user_id", "target_user_id", "text", "label"}
     missing = required.difference(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
 
-    x, artifacts = make_features(df)
+    if df["text"].isna().any():
+        print(f"Warning: {df['text'].isna().sum()} row(s) have missing text — filling with empty string.")
+        df["text"] = df["text"].fillna("")
+
+    unique_labels = sorted(df["label"].unique())
+    if set(unique_labels) - {0, 1}:
+        raise ValueError(f"Labels must be binary (0/1). Found: {unique_labels}")
+
     y = df["label"].to_numpy(dtype=int)
+
+    # Split BEFORE fitting any features to prevent data leakage
     train_idx, test_idx = stratified_train_test_split(y)
+    df_train = df.iloc[train_idx].reset_index(drop=True)
+    df_test = df.iloc[test_idx].reset_index(drop=True)
+    y_train = y[train_idx]
+    y_test = y[test_idx]
 
-    weights, bias = train_logistic_regression(x[train_idx], y[train_idx])
-    train_probs = sigmoid(x[train_idx] @ weights + bias)
-    test_probs = sigmoid(x[test_idx] @ weights + bias)
+    # Fit on train only, transform test using train statistics
+    x_train, artifacts = make_features_fit(df_train)
+    x_test = make_features_transform(df_test, artifacts)
 
-    train_metrics = metrics(y[train_idx], train_probs)
-    test_metrics = metrics(y[test_idx], test_probs)
+    weights, bias = train_logistic_regression(x_train, y_train)
+    train_probs = sigmoid(x_train @ weights + bias)
+    test_probs = sigmoid(x_test @ weights + bias)
+
+    train_m = metrics(y_train, train_probs)
+    test_m = metrics(y_test, test_probs)
 
     print("Multimodal Cyberbullying Detection")
     print("=" * 39)
-    print(f"Rows: {len(df)} | TF-IDF vocabulary: {len(artifacts.vocabulary)} | Features: {len(artifacts.feature_names)}")
+    print(
+        f"Rows: {len(df)} | Train: {len(df_train)} | Test: {len(df_test)} | "
+        f"TF-IDF vocab: {len(artifacts.vocabulary)} | Features: {len(artifacts.feature_names)}"
+    )
     print("\nTrain metrics")
     for key in ["accuracy", "precision", "recall", "f1"]:
-        print(f"  {key:9s}: {train_metrics[key]:.3f}")
+        print(f"  {key:9s}: {train_m[key]:.3f}")
     print("\nTest metrics")
     for key in ["accuracy", "precision", "recall", "f1"]:
-        print(f"  {key:9s}: {test_metrics[key]:.3f}")
-    print(f"  confusion : TP={test_metrics['tp']} TN={test_metrics['tn']} FP={test_metrics['fp']} FN={test_metrics['fn']}")
+        print(f"  {key:9s}: {test_m[key]:.3f}")
+    print(f"  confusion : TP={test_m['tp']} TN={test_m['tn']} FP={test_m['fp']} FN={test_m['fn']}")
 
-    print("\nStrongest positive cyberbullying signals")
-    ranked = sorted(
-        zip(artifacts.feature_names, weights),
-        key=lambda item: item[1],
-        reverse=True,
-    )
+    print(f"\nStrongest positive cyberbullying signals (top {args.top_n})")
+    ranked = sorted(zip(artifacts.feature_names, weights), key=lambda x: x[1], reverse=True)
     for name, weight in ranked[: args.top_n]:
         print(f"  {name:28s} {weight:+.3f}")
 
     print("\nExample predictions")
-    preview = df.loc[test_idx, ["post_id", "text", "label"]].copy()
-    preview["probability"] = np.round(test_probs, 3)
-    preview["prediction"] = (test_probs >= 0.5).astype(int)
-    for _, row in preview.iterrows():
-        print(f"  {row.post_id}: true={row.label} pred={row.prediction} prob={row.probability:.3f} | {row.text}")
+    for i, row in enumerate(df_test.itertuples(index=False)):
+        print(
+            f"  {row.post_id}: true={y_test[i]} pred={(test_probs[i] >= 0.5):.0f} "
+            f"prob={test_probs[i]:.3f} | {row.text}"
+        )
 
 
 if __name__ == "__main__":
